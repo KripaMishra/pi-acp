@@ -3,9 +3,11 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 const EXT_DIR = join(tmpdir(), 'pi-acp-todowrite-extension')
-const EXT_PATH = join(EXT_DIR, 'index.ts')
+const EXT_VERSION = 1
+const EXT_PATH = join(EXT_DIR, `index.v${EXT_VERSION}.ts`)
 
-const EXT_SOURCE = String.raw`import type { ExtensionAPI } from "@mariozechner/pi-coding-agent"
+const EXT_SOURCE = String.raw`// version: 1
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent"
 import { Type } from "typebox"
 
 function normalizeTodos(input: unknown) {
