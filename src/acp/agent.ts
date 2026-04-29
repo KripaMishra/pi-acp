@@ -23,9 +23,11 @@ import { getAuthMethods } from './auth.js'
 import { SessionManager } from './session.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
+import { ensureTodoWriteExtensionPath } from '../pi-rpc/todowrite-extension.js'
 import { listPiSessions, findPiSessionFile } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import { maybePlanUpdateFromToolEvent } from './todo-plan.js'
 import { promptToPiMessage } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
@@ -102,6 +104,8 @@ export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
+  private readonly piExtensionPaths = [ensureTodoWriteExtensionPath()]
+  private supportsPlanEntryIds = false
 
   dispose(): void {
     this.sessions.disposeAll()
@@ -117,6 +121,12 @@ export class PiAcpAgent implements ACPAgent {
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
     // We currently only support ACP protocol version 1.
+    const ccMeta = (params as any)?.clientCapabilities?._meta ?? {}
+    this.supportsPlanEntryIds =
+      ccMeta?.['plan-entry-ids'] === true ||
+      ccMeta?.['plan_entry_ids'] === true ||
+      ccMeta?.['plan-entry-id'] === true
+
     const supportedVersion = 1
     const requested = params.protocolVersion
 
@@ -175,7 +185,9 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      piExtensionPaths: this.piExtensionPaths,
+      includePlanEntryIds: this.supportsPlanEntryIds
     })
 
     // Fetch state + models once (parallel) to reduce startup latency.
@@ -303,7 +315,7 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
-    const session = this.sessions.get(params.sessionId)
+    const session = await this.getOrReattachSessionForPrompt(params.sessionId)
 
     const { message, images } = promptToPiMessage(params.prompt)
 
@@ -760,8 +772,71 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
-    const session = this.sessions.get(params.sessionId)
-    await session.cancel()
+    const maybe = (this.sessions as any).maybeGet?.(params.sessionId)
+    if (maybe) {
+      await maybe.cancel()
+      return
+    }
+
+    // Some tests replace `this.sessions` with a minimal fake that only implements `get`.
+    try {
+      const session = (this.sessions as any).get?.(params.sessionId)
+      if (!session) return
+      await session.cancel()
+    } catch {
+      // Best-effort for unknown session ids.
+      return
+    }
+  }
+
+  private async getOrReattachSessionForPrompt(sessionId: string) {
+    const existing = (this.sessions as any).maybeGet?.(sessionId)
+    if (existing) return existing
+
+    // Test fakes may only implement `get`; keep backward-compatible behavior.
+    if (!(this.sessions as any).maybeGet && (this.sessions as any).get) {
+      return (this.sessions as any).get(sessionId)
+    }
+
+    const stored = this.store.get(sessionId)
+    const cwd = stored?.cwd ?? this.lastSessionCwd
+    if (!cwd) {
+      throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
+    }
+
+    const sessionFile = stored?.sessionFile ?? findPiSessionFile(sessionId)
+    if (!sessionFile) {
+      throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
+    }
+
+    let proc: PiRpcProcess
+    try {
+      proc = await PiRpcProcess.spawn({
+        cwd,
+        sessionPath: sessionFile,
+        piCommand: process.env.PI_ACP_PI_COMMAND,
+        extensionPaths: this.piExtensionPaths
+      })
+    } catch (e: any) {
+      if (e?.name === 'PiRpcSpawnError') {
+        throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
+      }
+      throw e
+    }
+
+    const fileCommands = loadSlashCommands(cwd)
+    const session = this.sessions.getOrCreate(sessionId, {
+      cwd,
+      mcpServers: [],
+      conn: this.conn,
+      proc,
+      fileCommands,
+      piExtensionPaths: this.piExtensionPaths,
+      includePlanEntryIds: this.supportsPlanEntryIds
+    })
+
+    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
+    return session
   }
 
   async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -820,7 +895,8 @@ export class PiAcpAgent implements ACPAgent {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
         sessionPath: sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND
+        piCommand: process.env.PI_ACP_PI_COMMAND,
+        extensionPaths: this.piExtensionPaths
       })
     } catch (e: any) {
       if (e?.name === 'PiRpcSpawnError') {
@@ -837,7 +913,9 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       proc,
-      fileCommands
+      fileCommands,
+      piExtensionPaths: this.piExtensionPaths,
+      includePlanEntryIds: this.supportsPlanEntryIds
     })
 
     // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
@@ -854,6 +932,8 @@ export class PiAcpAgent implements ACPAgent {
     // Replay full conversation history.
     const data = (await proc.getMessages()) as any
     const messages = Array.isArray(data?.messages) ? data.messages : []
+
+    let latestPlanEntries: any[] | null = null
 
     for (const m of messages) {
       const role = String(m?.role ?? '')
@@ -889,6 +969,18 @@ export class PiAcpAgent implements ACPAgent {
         const toolCallId = String((m as any)?.toolCallId ?? crypto.randomUUID())
         const isError = Boolean((m as any)?.isError)
 
+        const planUpdate = maybePlanUpdateFromToolEvent(
+          {
+            toolName,
+            args: (m as any)?.args,
+            result: m
+          },
+          { includeIds: this.supportsPlanEntryIds }
+        )
+        if (planUpdate) {
+          latestPlanEntries = (planUpdate as any).entries ?? []
+        }
+
         // Create a synthetic ACP tool call to render historic tool usage.
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
@@ -915,6 +1007,16 @@ export class PiAcpAgent implements ACPAgent {
           }
         })
       }
+    }
+
+    if (latestPlanEntries) {
+      await this.conn.sessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'plan',
+          entries: latestPlanEntries
+        } as any
+      })
     }
 
     const models = await getModelState(proc)

@@ -15,6 +15,7 @@ import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/proces
 import { SessionStore } from './session-store.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
+import { maybePlanUpdateFromChecklistText, maybePlanUpdateFromToolEvent } from './todo-plan.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -22,6 +23,8 @@ type SessionCreateParams = {
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+  piExtensionPaths?: string[]
+  includePlanEntryIds?: boolean
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
@@ -106,7 +109,8 @@ export class SessionManager {
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
-        piCommand: params.piCommand
+        piCommand: params.piCommand,
+        extensionPaths: params.piExtensionPaths
       })
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {
@@ -135,7 +139,8 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      includePlanEntryIds: params.includePlanEntryIds ?? false
     })
 
     this.sessions.set(sessionId, session)
@@ -162,7 +167,8 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc: params.proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      includePlanEntryIds: params.includePlanEntryIds ?? false
     })
 
     this.sessions.set(sessionId, session)
@@ -181,6 +187,7 @@ export class PiAcpSession {
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
+  private readonly includePlanEntryIds: boolean
 
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
@@ -193,6 +200,7 @@ export class PiAcpSession {
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
+  private toolCallNames = new Map<string, string>()
 
   // pi can emit multiple `turn_end` events for a single user prompt (e.g. after tool_use).
   // The overall agent loop completes when `agent_end` is emitted.
@@ -206,6 +214,9 @@ export class PiAcpSession {
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
   private lastEmit: Promise<void> = Promise.resolve()
+  private latestPlanEntries: any[] | null = null
+  private assistantTextBuffer = ''
+  private lastChecklistPlanSignature: string | null = null
 
   constructor(opts: {
     sessionId: string
@@ -214,6 +225,7 @@ export class PiAcpSession {
     proc: PiRpcProcess
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
+    includePlanEntryIds?: boolean
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -221,6 +233,7 @@ export class PiAcpSession {
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
+    this.includePlanEntryIds = opts.includePlanEntryIds ?? false
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
@@ -331,6 +344,8 @@ export class PiAcpSession {
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
+    this.assistantTextBuffer = ''
+    this.lastChecklistPlanSignature = null
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
 
@@ -379,6 +394,21 @@ export class PiAcpSession {
 
         // Stream assistant text.
         if (ame?.type === 'text_delta' && typeof ame.delta === 'string') {
+          this.assistantTextBuffer += ame.delta
+
+          const fallbackPlan = maybePlanUpdateFromChecklistText(this.assistantTextBuffer, {
+            includeIds: this.includePlanEntryIds
+          })
+          if (fallbackPlan) {
+            const entries = (fallbackPlan as any).entries ?? []
+            const sig = JSON.stringify(entries)
+            if (sig !== this.lastChecklistPlanSignature) {
+              this.lastChecklistPlanSignature = sig
+              this.latestPlanEntries = entries
+              this.emit(fallbackPlan)
+            }
+          }
+
           this.emit({
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: ame.delta } satisfies ContentBlock
@@ -421,12 +451,22 @@ export class PiAcpSession {
                   })()
 
             const locations = toToolCallLocations(rawInput, this.cwd)
+            const planUpdate = maybePlanUpdateFromToolEvent(
+              { toolName, args: rawInput },
+              { includeIds: this.includePlanEntryIds }
+            )
+            if (planUpdate) {
+              this.latestPlanEntries = (planUpdate as any).entries ?? []
+              this.emit(planUpdate)
+            }
+
             const existingStatus = this.currentToolCalls.get(toolCallId)
             // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
             const status = existingStatus ?? 'pending'
 
             if (!existingStatus) {
               this.currentToolCalls.set(toolCallId, 'pending')
+              this.toolCallNames.set(toolCallId, toolName)
               this.emit({
                 sessionUpdate: 'tool_call',
                 toolCallId,
@@ -480,10 +520,16 @@ export class PiAcpSession {
         }
 
         const locations = toToolCallLocations(args, this.cwd, line)
+        const planUpdate = maybePlanUpdateFromToolEvent({ toolName, args }, { includeIds: this.includePlanEntryIds })
+        if (planUpdate) {
+          this.latestPlanEntries = (planUpdate as any).entries ?? []
+          this.emit(planUpdate)
+        }
 
         // If we already surfaced the tool call while the model streamed it, just transition.
         if (!this.currentToolCalls.has(toolCallId)) {
           this.currentToolCalls.set(toolCallId, 'in_progress')
+          this.toolCallNames.set(toolCallId, toolName)
           this.emit({
             sessionUpdate: 'tool_call',
             toolCallId,
@@ -533,6 +579,15 @@ export class PiAcpSession {
         const result = (ev as any).result
         const isError = Boolean((ev as any).isError)
         const text = toolResultToText(result)
+        const toolNameForPlan = String((ev as any).toolName ?? this.toolCallNames.get(toolCallId) ?? '')
+        const planUpdate = maybePlanUpdateFromToolEvent(
+          { toolName: toolNameForPlan, result },
+          { includeIds: this.includePlanEntryIds }
+        )
+        if (planUpdate) {
+          this.latestPlanEntries = (planUpdate as any).entries ?? []
+          this.emit(planUpdate)
+        }
 
         // If this was an edit and we captured a snapshot, emit a structured ACP diff.
         // This enables clients like Zed to render an actual diff UI.
@@ -573,6 +628,7 @@ export class PiAcpSession {
         })
 
         this.currentToolCalls.delete(toolCallId)
+        this.toolCallNames.delete(toolCallId)
         this.editSnapshots.delete(toolCallId)
         break
       }

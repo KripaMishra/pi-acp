@@ -12,6 +12,38 @@ class FakeStore {
   upsert() {}
 }
 
+test('PiAcpAgent: loadSession emits only latest todo plan snapshot', async () => {
+  const originalSpawn = PiRpcProcess.spawn
+  ;(PiRpcProcess as any).spawn = async () => {
+    return {
+      onEvent: () => () => {},
+      getMessages: async () => ({
+        messages: [
+          { role: 'toolResult', toolCallId: 't1', toolName: 'TodoWrite', content: [{ type: 'text', text: '{"todos":[{"content":"a","status":"pending"}]}' }] },
+          { role: 'toolResult', toolCallId: 't2', toolName: 'TodoWrite', content: [{ type: 'text', text: '{"todos":[{"content":"b","status":"completed"}]}' }] }
+        ]
+      }),
+      getAvailableModels: async () => ({ models: [] }),
+      getState: async () => ({ thinkingLevel: 'medium' })
+    } as any
+  }
+
+  try {
+    const conn = new FakeAgentSideConnection()
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    ;(agent as any).store = new FakeStore()
+
+    await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
+
+    const planUpdates = conn.updates.map(u => (u as any).update).filter(u => u?.sessionUpdate === 'plan')
+    assert.equal(planUpdates.length, 1)
+    assert.equal(planUpdates[0]!.entries[0]!.content, 'b')
+    assert.equal(planUpdates[0]!.entries[0]!.status, 'completed')
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
+  }
+})
+
 test('PiAcpAgent: loadSession replays toolResult as tool_call + tool_call_update', async () => {
   const originalSpawn = PiRpcProcess.spawn
   ;(PiRpcProcess as any).spawn = async () => {
