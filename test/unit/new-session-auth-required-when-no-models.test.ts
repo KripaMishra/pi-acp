@@ -8,6 +8,7 @@ class FakeSessions {
   async create(_params: any) {
     return this.session
   }
+  closeAllExcept(_sessionId: string) {}
 }
 
 test('PiAcpAgent: newSession throws AUTH_REQUIRED when pi reports zero available models', async () => {

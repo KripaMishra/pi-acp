@@ -34,7 +34,7 @@ import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-setti
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync } from 'node:fs'
-import type { AvailableCommand } from '@agentclientprotocol/sdk'
+import type { AvailableCommand, PlanEntry } from '@agentclientprotocol/sdk'
 import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { hasAnyPiAuthConfigured } from '../pi-auth/status.js'
@@ -108,6 +108,10 @@ import { fileURLToPath } from 'node:url'
 
 const pkg = readNearestPackageJson(import.meta.url)
 
+type ClientCapabilitiesWithMeta = {
+  _meta?: Record<string, unknown>
+}
+
 export class PiAcpAgent implements ACPAgent {
   private readonly conn: AgentSideConnection
   private readonly sessions = new SessionManager()
@@ -130,7 +134,10 @@ export class PiAcpAgent implements ACPAgent {
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
     // We currently only support ACP protocol version 1.
-    const ccMeta = (params as any)?.clientCapabilities?._meta ?? {}
+    // ACP SDK types do not currently expose `clientCapabilities._meta`, but clients
+    // use it for feature flags (e.g. plan-entry-ids, terminal-auth), so we read it
+    // through a narrow local type instead of widening the whole request to `any`.
+    const ccMeta = ((params.clientCapabilities as ClientCapabilitiesWithMeta | undefined)?._meta ?? {}) as Record<string, unknown>
     this.supportsPlanEntryIds =
       ccMeta?.['plan-entry-ids'] === true ||
       ccMeta?.['plan_entry_ids'] === true ||
@@ -149,7 +156,7 @@ export class PiAcpAgent implements ACPAgent {
       // Zed currently uses ClientCapabilities._meta["terminal-auth"] to decide whether to show
       // the "Authenticate" banner/button. If not supported, we still return the method for the registry.
       authMethods: getAuthMethods({
-        supportsTerminalAuthMeta: (params as any)?.clientCapabilities?._meta?.['terminal-auth'] === true
+        supportsTerminalAuthMeta: ccMeta['terminal-auth'] === true
       }),
       agentCapabilities: {
         loadSession: true,
@@ -261,9 +268,7 @@ export class PiAcpAgent implements ACPAgent {
       // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
       // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
       // It does NOT affect other client windows because they run in separate agent processes.
-      //
-      // (Tests sometimes stub out `this.sessions`, so guard the call.)
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
+    this.sessions.closeAllExcept(session.sessionId)
 
     const response = {
       sessionId: session.sessionId,
@@ -804,31 +809,18 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
-    const maybe = (this.sessions as any).maybeGet?.(params.sessionId)
+    const maybe = this.sessions.maybeGet(params.sessionId)
     if (maybe) {
       await maybe.cancel()
       return
     }
 
-    // Some tests replace `this.sessions` with a minimal fake that only implements `get`.
-    try {
-      const session = (this.sessions as any).get?.(params.sessionId)
-      if (!session) return
-      await session.cancel()
-    } catch {
-      // Best-effort for unknown session ids.
-      return
-    }
+    return
   }
 
   private async getOrReattachSessionForPrompt(sessionId: string) {
-    const existing = (this.sessions as any).maybeGet?.(sessionId)
+    const existing = this.sessions.maybeGet(sessionId)
     if (existing) return existing
-
-    // Test fakes may only implement `get`; keep backward-compatible behavior.
-    if (!(this.sessions as any).maybeGet && (this.sessions as any).get) {
-      return (this.sessions as any).get(sessionId)
-    }
 
     const stored = this.store.get(sessionId)
     const cwd = stored?.cwd ?? this.lastSessionCwd
@@ -859,7 +851,7 @@ export class PiAcpAgent implements ACPAgent {
     const fileCommands = loadSlashCommands(cwd)
     const session = this.sessions.getOrCreate(sessionId, {
       cwd,
-      mcpServers: [],
+      mcpServers: stored?.mcpServers ?? [],
       conn: this.conn,
       proc,
       fileCommands,
@@ -867,7 +859,7 @@ export class PiAcpAgent implements ACPAgent {
       includePlanEntryIds: this.supportsPlanEntryIds
     })
 
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
+    this.sessions.closeAllExcept(session.sessionId)
     return session
   }
 
@@ -951,21 +943,21 @@ export class PiAcpAgent implements ACPAgent {
     })
 
     // Policy: within a single ACP connection (one Zed window), keep only one live pi subprocess.
-    // (Tests sometimes stub out `this.sessions`, so guard the call.)
-    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
+    this.sessions.closeAllExcept(session.sessionId)
 
     // (Optional) ensure mapping stays fresh.
     this.store.upsert({
       sessionId: params.sessionId,
       cwd: params.cwd,
-      sessionFile
+      sessionFile,
+      mcpServers: params.mcpServers
     })
 
     // Replay full conversation history.
     const data = (await proc.getMessages()) as any
     const messages = Array.isArray(data?.messages) ? data.messages : []
 
-    let latestPlanEntries: any[] | null = null
+    let latestPlanEntries: PlanEntry[] | null = null
 
     for (const m of messages) {
       const role = String(m?.role ?? '')
@@ -1010,7 +1002,7 @@ export class PiAcpAgent implements ACPAgent {
           { includeIds: this.supportsPlanEntryIds }
         )
         if (planUpdate) {
-          latestPlanEntries = (planUpdate as any).entries ?? []
+          latestPlanEntries = (planUpdate.entries ?? []) as PlanEntry[]
         }
 
         // Create a synthetic ACP tool call to render historic tool usage.

@@ -10,6 +10,7 @@ class FakeSessions {
   async create() {
     throw new Error('pi should not be spawned when no auth is configured')
   }
+  closeAllExcept(_sessionId: string) {}
 }
 
 test('PiAcpAgent: newSession returns AUTH_REQUIRED without spawning pi when no auth configured', async () => {

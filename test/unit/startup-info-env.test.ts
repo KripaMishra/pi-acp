@@ -8,6 +8,7 @@ class FakeSessions {
   async create(_params: any) {
     return this.session
   }
+  closeAllExcept(_sessionId: string) {}
 }
 
 test('PiAcpAgent: quietStartup=true disables startup info generation/emission', async () => {
