@@ -41,6 +41,14 @@ import { hasAnyPiAuthConfigured } from '../pi-auth/status.js'
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
+const DEFAULT_SESSION_NAME_MAX_CHARS = 60
+
+function buildDefaultSessionNameFromPrompt(message: string, maxChars = DEFAULT_SESSION_NAME_MAX_CHARS): string | null {
+  const normalized = message.replace(/\s+/g, ' ').trim()
+  if (!normalized) return null
+  return normalized.slice(0, maxChars)
+}
+
 function builtinAvailableCommands(): AvailableCommand[] {
   return [
     {
@@ -106,6 +114,7 @@ export class PiAcpAgent implements ACPAgent {
   private readonly store = new SessionStore()
   private readonly piExtensionPaths = [ensureTodoWriteExtensionPath()]
   private supportsPlanEntryIds = false
+  private readonly autoNamedSessions = new Set<string>()
 
   dispose(): void {
     this.sessions.disposeAll()
@@ -318,6 +327,29 @@ export class PiAcpAgent implements ACPAgent {
     const session = await this.getOrReattachSessionForPrompt(params.sessionId)
 
     const { message, images } = promptToPiMessage(params.prompt)
+
+    // Set a default title from the first user query for fresh sessions.
+    // Skip slash commands so `/name` remains the explicit naming path.
+    if (!this.autoNamedSessions.has(session.sessionId) && images.length === 0 && !message.trimStart().startsWith('/')) {
+      const defaultName = buildDefaultSessionNameFromPrompt(message)
+      if (defaultName) {
+        try {
+          await session.proc.setSessionName(defaultName)
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'session_info_update',
+              title: defaultName,
+              updatedAt: new Date().toISOString()
+            }
+          })
+        } catch {
+          // Best effort: older pi versions may not support set_session_name.
+        } finally {
+          this.autoNamedSessions.add(session.sessionId)
+        }
+      }
+    }
 
     // Built-in ACP slash command handling (headless-friendly subset).
     // Note: file-based slash commands are expanded inside session.prompt().
