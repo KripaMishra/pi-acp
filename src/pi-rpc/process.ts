@@ -69,6 +69,15 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  /** Extra pi extensions to load via `-e <path>`. */
+  extensionPaths?: string[]
+}
+
+export function buildPiSpawnArgs(params: Pick<SpawnParams, 'sessionPath' | 'extensionPaths'>): string[] {
+  const args = ['--mode', 'rpc', '--no-themes']
+  if (params.sessionPath) args.push('--session', params.sessionPath)
+  for (const extPath of params.extensionPaths ?? []) args.push('-e', extPath)
+  return args
 }
 
 export class PiRpcProcess {
@@ -129,8 +138,7 @@ export class PiRpcProcess {
     // - themes are irrelevant in rpc mode and can be noisy/slow to load.
     // Keep extensions + prompt templates enabled because ACP users may rely on them
     // (e.g. MCP extensions, prompt templates for workflows).
-    const args = ['--mode', 'rpc', '--no-themes']
-    if (params.sessionPath) args.push('--session', params.sessionPath)
+    const args = buildPiSpawnArgs(params)
 
     const child = spawn(cmd, args, {
       cwd: params.cwd,

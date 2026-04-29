@@ -14,6 +14,10 @@ Expect some minor breaking changes.
 
 - Streams assistant output as ACP `agent_message_chunk`
 - Maps pi tool execution to ACP `tool_call` / `tool_call_update`
+- Maps TodoWrite-style todo updates to ACP `plan` updates (full replacement semantics)
+  - Emits empty `entries: []` when todos are cleared
+  - On `session/load`, replays only the latest todo plan snapshot
+  - Plan entry IDs are emitted only when client capabilities indicate support (`_meta.plan-entry-ids` / `_meta.plan_entry_ids` / `_meta.plan-entry-id`)
   - Tool call locations are surfaced when available for ACP clients that support opening the referenced file/context
   - Relative file paths from pi are resolved against the session cwd before being emitted as ACP tool locations, which enables follow-along features in clients like Zed
   - For `edit`, `pi-acp` attempts to infer a 1-based line number from a unique `oldText` match in the pre-edit file snapshot and includes it in the emitted tool location when possible

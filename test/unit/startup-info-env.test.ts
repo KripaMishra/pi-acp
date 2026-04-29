@@ -8,10 +8,12 @@ class FakeSessions {
   async create(_params: any) {
     return this.session
   }
+  closeAllExcept(_sessionId: string) {}
 }
 
 test('PiAcpAgent: quietStartup=true disables startup info generation/emission', async () => {
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR
+  const prevAnthropicKey = process.env.ANTHROPIC_API_KEY
 
   // Force quietStartup in pi settings by pointing PI_CODING_AGENT_DIR at a temp dir.
   const { mkdtempSync, writeFileSync } = await import('node:fs')
@@ -20,6 +22,7 @@ test('PiAcpAgent: quietStartup=true disables startup info generation/emission', 
   const dir = mkdtempSync(join(tmpdir(), 'pi-acp-quietstartup-'))
   writeFileSync(join(dir, 'settings.json'), JSON.stringify({ quietStartup: true }, null, 2), 'utf-8')
   process.env.PI_CODING_AGENT_DIR = dir
+  process.env.ANTHROPIC_API_KEY = 'test-key'
 
   // Spy on setTimeout calls (agent schedules startup info + available commands)
   const realSetTimeout = globalThis.setTimeout
@@ -77,5 +80,7 @@ test('PiAcpAgent: quietStartup=true disables startup info generation/emission', 
     ;(globalThis as any).setTimeout = realSetTimeout
     if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir
+    if (prevAnthropicKey == null) delete process.env.ANTHROPIC_API_KEY
+    else process.env.ANTHROPIC_API_KEY = prevAnthropicKey
   }
 })

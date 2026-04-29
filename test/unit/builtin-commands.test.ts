@@ -5,9 +5,13 @@ import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpe
 
 class FakeSessions {
   constructor(private readonly session: any) {}
+  maybeGet(_id: string) {
+    return this.session
+  }
   get(_id: string) {
     return this.session
   }
+  closeAllExcept(_sessionId: string) {}
 }
 
 test('PiAcpAgent: /steering is handled adapter-side', async () => {
@@ -54,4 +58,63 @@ test('PiAcpAgent: /name sets session display name adapter-side', async () => {
 
   const last = conn.updates.at(-1)
   assert.match((last as any).update.content.text, /Session name set: My Session/)
+})
+
+test('PiAcpAgent: first non-command prompt sets default session title once', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+  const setNames: string[] = []
+  proc.setSessionName = async (name: string) => {
+    setNames.push(name)
+  }
+
+  const session = {
+    sessionId: 's1',
+    proc,
+    fileCommands: [],
+    prompt: async () => 'end_turn'
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  await agent.prompt({
+    sessionId: 's1',
+    prompt: [{ type: 'text', text: '   Hello   there   from ACP    ' }]
+  } as any)
+
+  await agent.prompt({
+    sessionId: 's1',
+    prompt: [{ type: 'text', text: 'second message' }]
+  } as any)
+
+  assert.deepEqual(setNames, ['Hello there from ACP'])
+  const info = conn.updates.find(u => (u as any).update?.sessionUpdate === 'session_info_update')
+  assert.equal((info as any)?.update?.title, 'Hello there from ACP')
+})
+
+test('PiAcpAgent: first prompt slash command does not auto-name session', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+  let setCalls = 0
+  proc.setSessionName = async () => {
+    setCalls += 1
+  }
+
+  const session = {
+    sessionId: 's1',
+    proc,
+    fileCommands: [],
+    prompt: async () => 'end_turn'
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  await agent.prompt({
+    sessionId: 's1',
+    prompt: [{ type: 'text', text: '/steering' }]
+  } as any)
+
+  assert.equal(setCalls, 0)
 })

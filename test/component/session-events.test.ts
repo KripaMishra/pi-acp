@@ -34,6 +34,31 @@ test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
   })
 })
 
+test('PiAcpSession: emits plan update from markdown checklist text deltas', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'text_delta', delta: '- [ ] step one\n- [x] step two' }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const plan = conn.updates.find(u => (u as any).update?.sessionUpdate === 'plan') as any
+  assert.ok(plan)
+  assert.deepEqual(plan.update.entries.map((e: any) => e.status), ['pending', 'completed'])
+})
+
 test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -542,6 +567,174 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
 
   assert.equal(r1, 'cancelled')
   assert.equal(r2, 'cancelled')
+})
+
+test('PiAcpSession: emits plan update for TodoWrite and allows multiple in_progress', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'todo-1',
+    toolName: 'TodoWrite',
+    args: {
+      todos: [
+        { content: 'a', status: 'in_progress' },
+        { content: 'b', status: 'in_progress' },
+        { content: 'c', status: 'cancelled' }
+      ]
+    }
+  } as any)
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'todo-1',
+    toolName: 'TodoWrite',
+    isError: false,
+    result: {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            todos: [
+              { content: 'a', status: 'in_progress' },
+              { content: 'b', status: 'in_progress' },
+              { content: 'c', status: 'cancelled' }
+            ]
+          })
+        }
+      ]
+    }
+  } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const plan = conn.updates.find(u => (u as any).update?.sessionUpdate === 'plan') as any
+  assert.ok(plan)
+  assert.deepEqual(plan.update.entries.map((e: any) => e.status), ['in_progress', 'in_progress', 'pending'])
+  assert.deepEqual(plan.update.entries.map((e: any) => e.priority), ['medium', 'medium', 'medium'])
+  assert.equal('id' in plan.update.entries[0], false)
+})
+
+test('PiAcpSession: emits one plan update per TodoWrite execution', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: {
+        id: 'todo-once',
+        name: 'TodoWrite',
+        arguments: { todos: [{ content: 'a', status: 'pending' }] }
+      }
+    }
+  } as any)
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'todo-once',
+    toolName: 'TodoWrite',
+    args: { todos: [{ content: 'a', status: 'pending' }] }
+  } as any)
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'todo-once',
+    toolName: 'TodoWrite',
+    isError: false,
+    result: { content: [{ type: 'text', text: JSON.stringify({ todos: [{ content: 'a', status: 'pending' }] }) }] }
+  } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const plans = conn.updates.filter(u => (u as any).update?.sessionUpdate === 'plan') as any[]
+  assert.equal(plans.length, 1)
+})
+
+test('PiAcpSession: includes plan entry ids when capability is enabled', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    includePlanEntryIds: true
+  } as any)
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'todo-ids',
+    toolName: 'TodoWrite',
+    args: { todos: [{ content: 'a', status: 'pending' }] }
+  } as any)
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'todo-ids',
+    toolName: 'TodoWrite',
+    isError: false,
+    result: { content: [{ type: 'text', text: JSON.stringify({ todos: [{ content: 'a', status: 'pending' }] }) }] }
+  } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const plan = conn.updates.find(u => (u as any).update?.sessionUpdate === 'plan') as any
+  assert.ok(plan)
+  assert.equal(typeof plan.update.entries[0]?.id, 'string')
+})
+
+test('PiAcpSession: emits empty plan entries when todos are cleared', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'todo-2',
+    toolName: 'TodoWrite',
+    args: { todos: [] }
+  } as any)
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'todo-2',
+    toolName: 'TodoWrite',
+    isError: false,
+    result: { content: [{ type: 'text', text: JSON.stringify({ todos: [] }) }] }
+  } as any)
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const plan = conn.updates.find(u => (u as any).update?.sessionUpdate === 'plan') as any
+  assert.ok(plan)
+  assert.deepEqual(plan.update.entries, [])
 })
 
 test('PiAcpSession: expands /command before sending to pi', async () => {
