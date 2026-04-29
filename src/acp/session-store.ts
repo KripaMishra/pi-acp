@@ -1,11 +1,13 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import type { McpServer } from '@agentclientprotocol/sdk'
 import { getPiAcpSessionMapPath } from './paths.js'
 
 export type StoredSession = {
   sessionId: string
   cwd: string
   sessionFile: string
+  mcpServers: McpServer[]
   updatedAt: string
 }
 
@@ -45,15 +47,22 @@ export class SessionStore {
 
   get(sessionId: string): StoredSession | null {
     const db = loadFile(this.path)
-    return db.sessions[sessionId] ?? null
+    const session = db.sessions[sessionId]
+    if (!session) return null
+
+    return {
+      ...session,
+      mcpServers: Array.isArray((session as any).mcpServers) ? ((session as any).mcpServers as McpServer[]) : []
+    }
   }
 
-  upsert(entry: { sessionId: string; cwd: string; sessionFile: string }): void {
+  upsert(entry: { sessionId: string; cwd: string; sessionFile: string; mcpServers?: McpServer[] }): void {
     const db = loadFile(this.path)
     db.sessions[entry.sessionId] = {
       sessionId: entry.sessionId,
       cwd: entry.cwd,
       sessionFile: entry.sessionFile,
+      mcpServers: entry.mcpServers ?? [],
       updatedAt: new Date().toISOString()
     }
     saveFile(this.path, db)

@@ -2,6 +2,7 @@ import type {
   AgentSideConnection,
   ContentBlock,
   McpServer,
+  PlanEntry,
   SessionUpdate,
   ToolCallContent,
   ToolCallLocation,
@@ -130,7 +131,7 @@ export class SessionManager {
     const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
 
     if (sessionFile) {
-      this.store.upsert({ sessionId, cwd: params.cwd, sessionFile })
+      this.store.upsert({ sessionId, cwd: params.cwd, sessionFile, mcpServers: params.mcpServers })
     }
 
     const session = new PiAcpSession({
@@ -214,7 +215,7 @@ export class PiAcpSession {
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
   private lastEmit: Promise<void> = Promise.resolve()
-  private latestPlanEntries: any[] | null = null
+  private latestPlanEntries: PlanEntry[] | null = null
   private assistantTextBuffer = ''
   private lastChecklistPlanSignature: string | null = null
 
@@ -451,14 +452,6 @@ export class PiAcpSession {
                   })()
 
             const locations = toToolCallLocations(rawInput, this.cwd)
-            const planUpdate = maybePlanUpdateFromToolEvent(
-              { toolName, args: rawInput },
-              { includeIds: this.includePlanEntryIds }
-            )
-            if (planUpdate) {
-              this.latestPlanEntries = (planUpdate as any).entries ?? []
-              this.emit(planUpdate)
-            }
 
             const existingStatus = this.currentToolCalls.get(toolCallId)
             // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
@@ -520,11 +513,6 @@ export class PiAcpSession {
         }
 
         const locations = toToolCallLocations(args, this.cwd, line)
-        const planUpdate = maybePlanUpdateFromToolEvent({ toolName, args }, { includeIds: this.includePlanEntryIds })
-        if (planUpdate) {
-          this.latestPlanEntries = (planUpdate as any).entries ?? []
-          this.emit(planUpdate)
-        }
 
         // If we already surfaced the tool call while the model streamed it, just transition.
         if (!this.currentToolCalls.has(toolCallId)) {
